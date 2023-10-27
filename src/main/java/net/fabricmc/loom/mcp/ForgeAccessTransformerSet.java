@@ -16,6 +16,7 @@ import java.util.List;
 import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
+import java.util.function.BiFunction;
 import java.util.function.IntUnaryOperator;
 
 /**
@@ -59,36 +60,34 @@ public class ForgeAccessTransformerSet {
 	
 	public @Nonnull AccessTransformation getFieldTransformation(String className, String fieldName) {
 		AccessTransformation wildcardFieldTransformation = wildcardFieldTransformers.get(className);
-		if(wildcardFieldTransformation != null) {
-			usedWildcardFieldTransformers.add(className);
-			return wildcardFieldTransformation;
-		}
-		
 		String key = className + "." + fieldName;
 		AccessTransformation fieldTransformation = fieldTransformers.get(key);
-		if(fieldTransformation != null) {
-			usedFieldTransformers.add(key);
-			return fieldTransformation;
+		if(wildcardFieldTransformation != null) usedWildcardFieldTransformers.add(className);
+		if(fieldTransformation != null) usedFieldTransformers.add(key);
+		if (wildcardFieldTransformation == null) {
+			if (fieldTransformation != null)
+				return fieldTransformation;
+			return AccessTransformation.NO_CHANGE;
 		}
-		
-		return AccessTransformation.NO_CHANGE;
+		if (fieldTransformation != null)
+			return fieldTransformation.merge(wildcardFieldTransformation);
+		return wildcardFieldTransformation;
 	}
 	
 	public @Nonnull AccessTransformation getMethodTransformation(String className, String methodName, String methodDescriptor) {
 		AccessTransformation wildcardMethodTransformation = wildcardMethodTransformers.get(className);
-		if(wildcardMethodTransformation != null) {
-			usedWildcardMethodTransformers.add(className);
-			return wildcardMethodTransformation;
-		}
-		
 		String key = className + "." + methodName + methodDescriptor;
 		AccessTransformation methodTransformation = methodTransformers.get(key);
-		if(methodTransformation != null) {
-			usedMethodTransformers.add(key);
-			return methodTransformation;
+		if(wildcardMethodTransformation != null) usedWildcardMethodTransformers.add(className);
+		if(methodTransformation != null) usedMethodTransformers.add(key);
+		if (wildcardMethodTransformation == null) {
+			if (methodTransformation != null)
+				return methodTransformation;
+			return AccessTransformation.NO_CHANGE;
 		}
-		
-		return AccessTransformation.NO_CHANGE;
+		if (methodTransformation != null)
+			return methodTransformation.merge(wildcardMethodTransformation);
+		return wildcardMethodTransformation;
 	}
 	
 	public void load(Path path, boolean mappedAccessTransformers) throws IOException {
@@ -98,7 +97,8 @@ public class ForgeAccessTransformerSet {
 			
 			String[] split = line.split(" ");
 			AccessTransformation transformationType = AccessTransformation.fromString(split[0]);
-			
+			BiFunction<String, AccessTransformation, AccessTransformation> transformer = (cls, oldType) -> oldType == null ? transformationType : oldType.merge(transformationType);
+
 			if(mappedAccessTransformers) { //Forge 1.7 format - class names separated from method/field names with a space
 				String owningClass = split[1].replace('.', '/'); //-> normalize to 'internal name'
 				touchedClasses.add(owningClass);
@@ -106,14 +106,14 @@ public class ForgeAccessTransformerSet {
 				if(split.length > 2) {
 					String member = split[2].replace('.', '/'); //-> normalize to 'internal name'
 					if(member.contains("(")) {
-						if(member.contains("*")) wildcardMethodTransformers.put(owningClass, transformationType);
-						else methodTransformers.put(owningClass + "." + member, transformationType);
+						if(member.contains("*")) wildcardMethodTransformers.compute(owningClass, transformer);
+						else methodTransformers.compute(owningClass + "." + member, transformer);
 					} else {
-						if(member.contains("*")) wildcardFieldTransformers.put(owningClass, transformationType);
-						else fieldTransformers.put(owningClass + "." + member, transformationType);
+						if(member.contains("*")) wildcardFieldTransformers.compute(owningClass, transformer);
+						else fieldTransformers.compute(owningClass + "." + member, transformer);
 					}
 				} else {
-					classTransformers.put(owningClass, transformationType);
+					classTransformers.compute(owningClass, transformer);
 				}
 			} else { //Forge 1.6 and below format - class names glued to method/field names with a "."
 				String target = split[1];
@@ -127,15 +127,15 @@ public class ForgeAccessTransformerSet {
 					touchedClasses.add(owningClass);
 					
 					if(member.contains("(")) {
-						if(member.contains("*")) wildcardMethodTransformers.put(owningClass, transformationType);
-						else methodTransformers.put(target, transformationType);
+						if(member.contains("*")) wildcardMethodTransformers.compute(owningClass, transformer);
+						else methodTransformers.compute(target, transformer);
 					} else {
-						if(member.contains("*")) wildcardFieldTransformers.put(owningClass, transformationType);
-						else fieldTransformers.put(target, transformationType);
+						if(member.contains("*")) wildcardFieldTransformers.compute(owningClass, transformer);
+						else fieldTransformers.compute(target, transformer);
 					}
 				} else {
 					touchedClasses.add(target);
-					classTransformers.put(target, transformationType);
+					classTransformers.compute(target, transformer);
 				}
 			}
 		}
@@ -207,6 +207,40 @@ public class ForgeAccessTransformerSet {
 	
 	private static final int ACCESS_MASK = (Opcodes.ACC_PUBLIC | Opcodes.ACC_PRIVATE | Opcodes.ACC_PROTECTED); // == 7
 	private static final int ACC_PACKAGE_PRIVATE = 0;
+
+	public enum Access {
+		PUBLIC,
+		PROTECTED,
+		PACKAGE_PRIVATE,
+		PRIVATE,
+		NO_CHANGE;
+
+		public Access merge(Access other) {
+			return this.ordinal() < other.ordinal() ? this : other;
+		}
+	}
+
+	public enum Finalize {
+		NO_CHANGE,
+		FINALIZE,
+		DEFINALIZE;
+
+		public Finalize merge(Finalize other) {
+			switch (this) {
+				case FINALIZE:
+					if (other == DEFINALIZE)
+						throw new IllegalArgumentException("Conflicting access transformers");
+					return this;
+				case DEFINALIZE:
+					if (other == FINALIZE)
+						throw new IllegalArgumentException("Conflicting access transformers");
+					return this;
+				default:
+					return other;
+			}
+		}
+	}
+
 	public enum AccessTransformation implements Opcodes {
 		NO_CHANGE                  (acc -> acc),
 		PUBLIC                     (acc -> upgradePublicityModifier(acc,             ACC_PUBLIC)),
@@ -232,7 +266,93 @@ public class ForgeAccessTransformerSet {
 		public int apply(int prevAccess) {
 			return operation.applyAsInt(prevAccess);
 		}
-		
+
+		private Access getAccess() {
+			switch (this) {
+				case PUBLIC:
+				case PUBLIC_DEFINALIZE:
+				case PUBLIC_FINALIZE:
+					return Access.PUBLIC;
+				case PACKAGE_PRIVATE:
+				case PACKAGE_PRIVATE_FINALIZE:
+				case PACKAGE_PRIVATE_DEFINALIZE:
+					return Access.PACKAGE_PRIVATE;
+				case PROTECTED:
+				case PROTECTED_DEFINALIZE:
+				case PROTECTED_FINALIZE:
+					return Access.PROTECTED;
+				case PRIVATE:
+				case PRIVATE_DEFINALIZE:
+				case PRIVATE_FINALIZE:
+					return Access.PRIVATE;
+				default:
+					return Access.NO_CHANGE;
+			}
+		}
+
+		private Finalize getFinalize() {
+			switch (this) {
+				case PUBLIC_DEFINALIZE:
+				case PACKAGE_PRIVATE_DEFINALIZE:
+				case PRIVATE_DEFINALIZE:
+				case PROTECTED_DEFINALIZE:
+					return Finalize.DEFINALIZE;
+				case PUBLIC_FINALIZE:
+				case PACKAGE_PRIVATE_FINALIZE:
+				case PROTECTED_FINALIZE:
+				case PRIVATE_FINALIZE:
+					return Finalize.FINALIZE;
+				default:
+					return Finalize.NO_CHANGE;
+			}
+		}
+
+		public AccessTransformation merge(AccessTransformation other) {
+			Access acc = this.getAccess().merge(other.getAccess());
+			Finalize fin = this.getFinalize().merge(other.getFinalize());
+			switch (acc) {
+				case PUBLIC:
+					switch (fin) {
+						case FINALIZE:
+							return PUBLIC_FINALIZE;
+						case DEFINALIZE:
+							return PUBLIC_DEFINALIZE;
+						default:
+							return PUBLIC;
+					}
+				case PROTECTED:
+					switch (fin) {
+						case FINALIZE:
+							return PROTECTED_FINALIZE;
+						case DEFINALIZE:
+							return PROTECTED_DEFINALIZE;
+						default:
+							return PROTECTED;
+					}
+				case PACKAGE_PRIVATE:
+					switch (fin) {
+						case FINALIZE:
+							return PACKAGE_PRIVATE_FINALIZE;
+						case DEFINALIZE:
+							return PACKAGE_PRIVATE_DEFINALIZE;
+						default:
+							return PACKAGE_PRIVATE;
+					}
+				case PRIVATE:
+					switch (fin) {
+						case FINALIZE:
+							return PRIVATE_FINALIZE;
+						case DEFINALIZE:
+							return PRIVATE_DEFINALIZE;
+						default:
+							return PRIVATE;
+					}
+				default:
+					//Doesn't handle finalize/definalize with no changes, but that's not a feature.
+					return NO_CHANGE;
+			}
+		}
+
 		public static AccessTransformation fromString(String name) {
 			switch(name) {
 				case "public": return PUBLIC;
